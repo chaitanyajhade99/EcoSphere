@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ecosphere-backend
+    env: python
+    plan: free
+    root: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+
+  - type: static-site
+    name: ecosphere-frontend
+    env: static
+    plan: free
+    root: frontend
+    buildCommand: yarn install && yarn build
+    publishPath: build
