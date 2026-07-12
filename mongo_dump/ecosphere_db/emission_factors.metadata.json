@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"}],"uuid":"cbaf660df325468e93bec96b5171068c","collectionName":"emission_factors","type":"collection"}
