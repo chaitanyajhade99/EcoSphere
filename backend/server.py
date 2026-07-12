@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 from pathlib import Path
+import sys
 ROOT_DIR = Path(__file__).parent
+sys.path.insert(0, str(ROOT_DIR))
 load_dotenv(ROOT_DIR / '.env', override=True)
 
 import os
@@ -33,6 +35,12 @@ from auth import (
 )
 from seed import seed_all
 import ai_service
+from esg_features import (
+    calculate_compliance_risk_score,
+    detect_anomalies,
+    infer_csr_category,
+    evaluate_badge_unlock,
+)
 
 logger = logging.getLogger("ecosphere")
 logging.basicConfig(level=logging.INFO)
@@ -71,12 +79,30 @@ def set_auth_cookie(response: Response, token: str):
     )
 
 
+def parse_iso_datetime(value: Optional[str]):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # ---------- STARTUP ----------
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
-    await seed_all(db)
-    logger.info("EcoSphere seed complete.")
+    try:
+        await seed_all(db)
+        logger.info("EcoSphere seed complete.")
+    except Exception:
+        logger.exception("Seeding failed during startup — continuing without seeding")
     # Background task: flag overdue compliance issues every 60s
     asyncio.create_task(_overdue_flagging_loop())
 
@@ -461,6 +487,12 @@ async def get_transactions(user: dict = Depends(current_user)):
     return await db.carbon_transactions.find({}, {"_id": 0}).sort("date", -1).to_list(200)
 
 
+@api.get("/environmental/anomalies")
+async def get_anomalies(user: dict = Depends(current_user)):
+    transactions = await db.carbon_transactions.find({}, {"_id": 0}).sort("date", -1).to_list(200)
+    return detect_anomalies(transactions)
+
+
 @api.post("/environmental/transactions")
 async def add_transaction(tx: CarbonTransaction, user: dict = Depends(current_user)):
     config_doc = await db.esg_config.find_one({})
@@ -564,6 +596,9 @@ async def add_csr(a: CSRActivity, user: dict = Depends(current_user)):
     a.organizer = user["name"]
     a.id = new_id()  # always regenerate server-side
     doc = a.model_dump()
+    if not a.category:
+        a.category = infer_csr_category(a.title, a.description)
+    doc = a.model_dump()
     await db.csr_activities.insert_one(doc)
     await db.activities.insert_one({
         "id": new_id(), "user_id": user["id"], "user_name": user["name"],
@@ -646,7 +681,24 @@ async def get_audits(user: dict = Depends(current_user)):
 
 @api.get("/governance/issues")
 async def get_issues(user: dict = Depends(current_user)):
-    return await db.compliance_issues.find({}, {"_id": 0}).sort("due_date", 1).to_list(100)
+    issues = []
+    async for issue in db.compliance_issues.find({}, {"_id": 0}).sort("due_date", 1):
+        overdue = bool(issue.get("overdue", False))
+        due_date = issue.get("due_date")
+        if due_date and parse_iso_datetime(due_date) and parse_iso_datetime(due_date) < datetime.now(timezone.utc):
+            overdue = True
+        risk_score = issue.get("risk_score") or calculate_compliance_risk_score(
+            issue.get("severity", "medium"),
+            due_date,
+            status=issue.get("status", "open"),
+            overdue=overdue,
+            owner_history=issue.get("owner_history", 0),
+        )
+        issue_with_score = dict(issue)
+        issue_with_score["overdue"] = overdue
+        issue_with_score["risk_score"] = risk_score
+        issues.append(issue_with_score)
+    return issues
 
 
 @api.post("/governance/issues")
@@ -657,14 +709,22 @@ async def create_issue(issue: ComplianceIssue, user: dict = Depends(current_user
         raise HTTPException(status_code=400, detail="Owner and Due Date are mandatory compliance fields")
     
     issue.id = new_id()
-    now = datetime.now(timezone.utc).isoformat()
-    issue_overdue = False
-    if issue.due_date < now:
-        issue_overdue = True
-        
+    now = datetime.now(timezone.utc)
+    issue_due_date = parse_iso_datetime(issue.due_date)
+    issue_overdue = bool(issue_due_date and issue_due_date < now)
+    risk_score = calculate_compliance_risk_score(
+        issue.severity,
+        issue.due_date,
+        status=issue.status,
+        overdue=issue_overdue,
+        owner_history=0,
+    )
+
     doc = issue.model_dump()
     doc["overdue"] = issue_overdue
-    
+    doc["risk_score"] = risk_score
+    doc["owner_history"] = 0
+
     await db.compliance_issues.insert_one(doc)
     
     await db.notifications.insert_one({
@@ -751,9 +811,22 @@ async def update_issue_status(issue_id: str, body: dict, user: dict = Depends(cu
     existing = await db.compliance_issues.find_one({"id": issue_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Issue not found")
+    existing_issue = await db.compliance_issues.find_one({"id": issue_id})
     update_fields = {"status": new_status}
     if new_status == "resolved":
         update_fields["overdue"] = False
+    if existing_issue:
+        issue_due = existing_issue.get("due_date")
+        issue_overdue = bool(parse_iso_datetime(issue_due) and parse_iso_datetime(issue_due) < datetime.now(timezone.utc))
+        risk_score = calculate_compliance_risk_score(
+            existing_issue.get("severity", "medium"),
+            issue_due,
+            status=new_status,
+            overdue=issue_overdue and new_status != "resolved",
+            owner_history=existing_issue.get("owner_history", 0),
+        )
+        update_fields["risk_score"] = risk_score
+        update_fields["overdue"] = issue_overdue and new_status != "resolved"
     await db.compliance_issues.update_one({"id": issue_id}, {"$set": update_fields})
     await compute_and_save_department_scores(db)
     return {"ok": True}
@@ -846,6 +919,18 @@ async def ai_advisor(req: AIChatRequest, user: dict = Depends(current_user)):
     except Exception as e:
         logger.exception("AI advisor error – returning fallback")
         return {"reply": "I'm currently unable to connect to the AI service. Please try again shortly, or check your Groq API key configuration.", "session_id": session_id}
+
+
+@api.get("/ai/health")
+async def ai_health(user: dict = Depends(current_user)):
+    """Lightweight AI config health check (does not make network calls).
+    Use this to validate that a GROQ_API_KEY is configured before a demo.
+    """
+    try:
+        configured = ai_service.is_groq_configured()
+    except Exception:
+        configured = False
+    return {"configured": configured, "model_env": os.environ.get("GROQ_MODEL", "(default)")}
 
 
 @api.post("/ai/report")
@@ -1022,22 +1107,18 @@ async def check_badge_unlocks(db, user_id: str):
         badge_key = b["name"].lower().replace(" ", "_")
         if badge_key in owned:
             continue
-        
-        should_unlock = False
-        req = b.get("requirement", "").lower()
-        if "first challenge" in req and completed_challenges_count >= 1:
-            should_unlock = True
-        elif "5 env challenges" in req and completed_challenges_count >= 5:
-            should_unlock = True
-        elif "25 csr hours" in req and csr_hours >= 25.0:
-            should_unlock = True
-        elif "all policies" in req and all_policies_ack:
-            should_unlock = True
-        elif "30% reduction" in req and user.get("xp", 0) >= 1500:
-            should_unlock = True
-        elif "top-3" in req and user.get("level", 1) >= 5:
-            should_unlock = True
-            
+
+        should_unlock = evaluate_badge_unlock(
+            b,
+            {
+                "completed_challenges_count": completed_challenges_count,
+                "csr_hours": csr_hours,
+                "all_policies_ack": all_policies_ack,
+                "xp": user.get("xp", 0),
+                "level": user.get("level", 1),
+            },
+        )
+
         if should_unlock:
             await db.users.update_one(
                 {"id": user_id},
@@ -1431,6 +1512,12 @@ async def search(q: str, user: dict = Depends(current_user)):
         if q_lower in a["title"].lower():
             results.append({"type": "csr", **a})
     return results[:20]
+
+
+@api.get("/")
+async def api_root():
+    """API-level health endpoint so clients can ping `/api/` directly."""
+    return {"status": "ok", "api": "EcoSphere ESG Platform"}
 
 
 # ---------- health ----------
