@@ -1,10 +1,11 @@
 from dotenv import load_dotenv
 from pathlib import Path
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / '.env', override=True)
 
 import os
 import logging
+import asyncio
 from typing import List, Optional
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -16,7 +17,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from models import (
     LoginRequest, RegisterRequest, UserPublic, Department,
-    EmissionFactor, CarbonTransaction, SustainabilityGoal,
+    EmissionFactor, CarbonTransaction, SustainabilityGoal, ProductESGProfile,
     CSRActivity, DiversityMetric,
     ESGPolicy, Audit, ComplianceIssue,
     Challenge, Badge, Reward, RewardRedemption,
@@ -76,6 +77,18 @@ async def startup():
     await db.users.create_index("email", unique=True)
     await seed_all(db)
     logger.info("EcoSphere seed complete.")
+    # Background task: flag overdue compliance issues every 60s
+    asyncio.create_task(_overdue_flagging_loop())
+
+
+async def _overdue_flagging_loop():
+    """Periodic background job — flags overdue compliance issues every 60 seconds."""
+    while True:
+        try:
+            await flag_overdue_compliance_issues(db)
+        except Exception:
+            logger.exception("Overdue flagging loop error")
+        await asyncio.sleep(60)
 
 
 # ---------- AUTH ----------
@@ -136,7 +149,12 @@ async def dashboard_overview(user: dict = Depends(current_user)):
     total_e = sum(d["e_score"] for d in depts) / max(len(depts), 1)
     total_s = sum(d["s_score"] for d in depts) / max(len(depts), 1)
     total_g = sum(d["g_score"] for d in depts) / max(len(depts), 1)
-    esg_score = round((total_e + total_s + total_g) / 3, 1)
+    
+    config_doc = await db.esg_config.find_one({})
+    w_e = float(config_doc.get("weight_e", 40.0)) / 100.0 if config_doc else 0.4
+    w_s = float(config_doc.get("weight_s", 30.0)) / 100.0 if config_doc else 0.3
+    w_g = float(config_doc.get("weight_g", 30.0)) / 100.0 if config_doc else 0.3
+    esg_score = round(total_e * w_e + total_s * w_s + total_g * w_g, 1)
 
     total_co2 = 0
     async for t in db.carbon_transactions.find({}, {"_id": 0, "co2e_kg": 1}):
@@ -404,6 +422,40 @@ async def get_factors(user: dict = Depends(current_user)):
     return await db.emission_factors.find({}, {"_id": 0}).to_list(200)
 
 
+@api.post("/environmental/factors")
+async def create_factor(factor: EmissionFactor, user: dict = Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    factor.id = new_id()
+    doc = factor.model_dump()
+    await db.emission_factors.insert_one(doc)
+    return strip_id(doc)
+
+
+@api.put("/environmental/factors/{fid}")
+async def update_factor(fid: str, factor: EmissionFactor, user: dict = Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    existing = await db.emission_factors.find_one({"id": fid})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Factor not found")
+    await db.emission_factors.update_one({"id": fid}, {"$set": {
+        "category": factor.category, "unit": factor.unit,
+        "factor": factor.factor, "scope": factor.scope, "source": factor.source
+    }})
+    return {"ok": True}
+
+
+@api.delete("/environmental/factors/{fid}")
+async def delete_factor(fid: str, user: dict = Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    result = await db.emission_factors.delete_one({"id": fid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Factor not found")
+    return {"ok": True}
+
+
 @api.get("/environmental/transactions")
 async def get_transactions(user: dict = Depends(current_user)):
     return await db.carbon_transactions.find({}, {"_id": 0}).sort("date", -1).to_list(200)
@@ -411,10 +463,15 @@ async def get_transactions(user: dict = Depends(current_user)):
 
 @api.post("/environmental/transactions")
 async def add_transaction(tx: CarbonTransaction, user: dict = Depends(current_user)):
-    factor = await db.emission_factors.find_one({"id": tx.factor_id}, {"_id": 0})
-    if factor:
-        tx.co2e_kg = round(tx.quantity * factor["factor"], 2)
-        tx.scope = factor["scope"]
+    config_doc = await db.esg_config.find_one({})
+    auto_calc = config_doc.get("auto_emission_calc", True) if config_doc else True
+    
+    if auto_calc:
+        factor = await db.emission_factors.find_one({"id": tx.factor_id}, {"_id": 0})
+        if factor:
+            tx.co2e_kg = round(tx.quantity * factor["factor"], 2)
+            tx.scope = factor["scope"]
+    
     tx.id = new_id()  # always regenerate server-side
     doc = tx.model_dump()
     await db.carbon_transactions.insert_one(doc)
@@ -432,12 +489,68 @@ async def get_goals(user: dict = Depends(current_user)):
     return await db.sustainability_goals.find({}, {"_id": 0}).to_list(100)
 
 
+@api.post("/environmental/goals")
+async def create_goal(goal: SustainabilityGoal, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins and managers can create goals")
+    goal.id = new_id()
+    doc = goal.model_dump()
+    await db.sustainability_goals.insert_one(doc)
+    await compute_and_save_department_scores(db)
+    return strip_id(doc)
+
+
 @api.get("/environmental/scope-breakdown")
 async def scope_breakdown(user: dict = Depends(current_user)):
     scopes = defaultdict(float)
     async for t in db.carbon_transactions.find({}, {"_id": 0}):
         scopes[t.get("scope", 0)] += t["co2e_kg"]
     return [{"scope": f"Scope {k}", "value": round(v, 2)} for k, v in sorted(scopes.items())]
+
+
+# ---------- PRODUCT ESG PROFILES ----------
+@api.get("/environmental/products")
+async def get_products(user: dict = Depends(current_user)):
+    return await db.product_esg_profiles.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.post("/environmental/products")
+async def create_product(product: ProductESGProfile, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins and managers can create product profiles")
+    product.id = new_id()
+    doc = product.model_dump()
+    await db.product_esg_profiles.insert_one(doc)
+    return strip_id(doc)
+
+
+@api.put("/environmental/products/{pid}")
+async def update_product(pid: str, product: ProductESGProfile, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins and managers can update product profiles")
+    existing = await db.product_esg_profiles.find_one({"id": pid})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Product not found")
+    await db.product_esg_profiles.update_one({"id": pid}, {"$set": {
+        "name": product.name, "sku": product.sku, "category": product.category,
+        "carbon_footprint_kg": product.carbon_footprint_kg,
+        "recyclability_percent": product.recyclability_percent,
+        "sustainability_score": product.sustainability_score,
+        "certifications": product.certifications,
+        "lifecycle_stage": product.lifecycle_stage,
+        "department": product.department, "notes": product.notes
+    }})
+    return {"ok": True}
+
+
+@api.delete("/environmental/products/{pid}")
+async def delete_product(pid: str, user: dict = Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    result = await db.product_esg_profiles.delete_one({"id": pid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"ok": True}
 
 
 # ---------- SOCIAL ----------
@@ -482,6 +595,42 @@ async def get_policies(user: dict = Depends(current_user)):
     return await db.policies.find({}, {"_id": 0}).to_list(100)
 
 
+@api.post("/governance/policies")
+async def create_policy(policy: ESGPolicy, user: dict = Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    policy.id = new_id()
+    doc = policy.model_dump()
+    await db.policies.insert_one(doc)
+    return strip_id(doc)
+
+
+@api.put("/governance/policies/{pid}")
+async def update_policy(pid: str, policy: ESGPolicy, user: dict = Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    existing = await db.policies.find_one({"id": pid})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    await db.policies.update_one({"id": pid}, {"$set": {
+        "title": policy.title, "category": policy.category, "version": policy.version,
+        "summary": policy.summary, "body": policy.body,
+        "effective_date": policy.effective_date, "review_date": policy.review_date,
+        "status": policy.status
+    }})
+    return {"ok": True}
+
+
+@api.delete("/governance/policies/{pid}")
+async def delete_policy(pid: str, user: dict = Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    result = await db.policies.delete_one({"id": pid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    return {"ok": True}
+
+
 @api.post("/governance/policies/{policy_id}/acknowledge")
 async def ack_policy(policy_id: str, user: dict = Depends(current_user)):
     await db.policies.update_one(
@@ -498,6 +647,116 @@ async def get_audits(user: dict = Depends(current_user)):
 @api.get("/governance/issues")
 async def get_issues(user: dict = Depends(current_user)):
     return await db.compliance_issues.find({}, {"_id": 0}).sort("due_date", 1).to_list(100)
+
+
+@api.post("/governance/issues")
+async def create_issue(issue: ComplianceIssue, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins and managers can create compliance issues")
+    if not issue.owner or not issue.due_date:
+        raise HTTPException(status_code=400, detail="Owner and Due Date are mandatory compliance fields")
+    
+    issue.id = new_id()
+    now = datetime.now(timezone.utc).isoformat()
+    issue_overdue = False
+    if issue.due_date < now:
+        issue_overdue = True
+        
+    doc = issue.model_dump()
+    doc["overdue"] = issue_overdue
+    
+    await db.compliance_issues.insert_one(doc)
+    
+    await db.notifications.insert_one({
+        "id": new_id(),
+        "user_id": None,
+        "title": f"⚠️ New Compliance Issue: {issue.title}",
+        "message": f"A new compliance issue has been opened for {issue.department}. Severity: {issue.severity.upper()}.",
+        "type": "warning",
+        "read": False,
+        "created_at": now_iso()
+    })
+    
+    await compute_and_save_department_scores(db)
+    return strip_id(doc)
+
+
+@api.post("/governance/audits")
+async def create_audit(audit: Audit, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins and managers can create audits")
+    audit.id = new_id()
+    doc = audit.model_dump()
+    await db.audits.insert_one(doc)
+    await compute_and_save_department_scores(db)
+    return strip_id(doc)
+
+
+@api.post("/governance/policies/{policy_id}/remind")
+async def remind_policy(policy_id: str, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins and managers can send policy reminders")
+    
+    policy = await db.policies.find_one({"id": policy_id})
+    if not policy:
+        raise HTTPException(status_code=404, detail="Policy not found")
+        
+    acknowledged_user_ids = set(policy.get("acknowledgements", []))
+    all_users = await db.users.find({}).to_list(1000)
+    
+    reminded_count = 0
+    for u in all_users:
+        if u["id"] not in acknowledged_user_ids:
+            await db.notifications.insert_one({
+                "id": new_id(),
+                "user_id": u["id"],
+                "title": f"🔔 Action Required: Policy Acknowledgment Reminder",
+                "message": f"Please read and acknowledge the policy: '{policy['title']}' (v{policy.get('version', '1.0')}).",
+                "type": "info",
+                "read": False,
+                "created_at": now_iso()
+            })
+            reminded_count += 1
+            
+    return {"ok": True, "reminded_count": reminded_count}
+
+
+@api.patch("/governance/audits/{audit_id}/status")
+async def update_audit_status(audit_id: str, body: dict, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins/managers can update audit status")
+    new_status = body.get("status")
+    if new_status not in ["scheduled", "in_progress", "completed"]:
+        raise HTTPException(status_code=400, detail="Invalid audit status")
+    existing = await db.audits.find_one({"id": audit_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    update_fields = {"status": new_status}
+    if "findings" in body:
+        update_fields["findings"] = int(body["findings"])
+    if "score" in body:
+        update_fields["score"] = float(body["score"])
+    await db.audits.update_one({"id": audit_id}, {"$set": update_fields})
+    await compute_and_save_department_scores(db)
+    return {"ok": True}
+
+
+@api.patch("/governance/issues/{issue_id}/status")
+async def update_issue_status(issue_id: str, body: dict, user: dict = Depends(current_user)):
+    if user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Only admins/managers can update issue status")
+    new_status = body.get("status")
+    if new_status not in ["open", "in_progress", "resolved"]:
+        raise HTTPException(status_code=400, detail="Invalid issue status")
+    existing = await db.compliance_issues.find_one({"id": issue_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    update_fields = {"status": new_status}
+    if new_status == "resolved":
+        update_fields["overdue"] = False
+    await db.compliance_issues.update_one({"id": issue_id}, {"$set": update_fields})
+    await compute_and_save_department_scores(db)
+    return {"ok": True}
 
 
 # ---------- GAMIFICATION ----------
@@ -585,8 +844,8 @@ async def ai_advisor(req: AIChatRequest, user: dict = Depends(current_user)):
         })
         return {"reply": reply, "session_id": session_id}
     except Exception as e:
-        logger.exception("AI advisor error")
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
+        logger.exception("AI advisor error – returning fallback")
+        return {"reply": "I'm currently unable to connect to the AI service. Please try again shortly, or check your Groq API key configuration.", "session_id": session_id}
 
 
 @api.post("/ai/report")
@@ -600,8 +859,8 @@ async def ai_report(req: AIReportRequest, user: dict = Depends(current_user)):
         )
         return report
     except Exception as e:
-        logger.exception("AI report error")
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
+        logger.exception("AI report error – returning fallback")
+        return {"title": f"{req.report_type.title()} ESG Report", "period": req.period, "sections": [], "error": "AI service temporarily unavailable. Mock data returned.", "generated_at": now_iso()}
 
 
 @api.post("/ai/compliance-check")
@@ -609,8 +868,8 @@ async def ai_compliance(req: AICompliancePayload, user: dict = Depends(current_u
     try:
         return await ai_service.compliance_check(req.context)
     except Exception as e:
-        logger.exception("AI compliance error")
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
+        logger.exception("AI compliance error – returning fallback")
+        return {"risk_level": "medium", "overall_status": "AI service unavailable – manual review recommended", "findings": ["AI service could not be reached."], "recommendations": [{"action": "Retry when AI service is available", "standard_ref": "N/A", "why": "Automated compliance analysis requires an active AI connection."}]}
 
 
 @api.post("/ai/carbon-forecast")
@@ -619,8 +878,8 @@ async def ai_forecast(user: dict = Depends(current_user)):
     try:
         return await ai_service.carbon_forecast(trend)
     except Exception as e:
-        logger.exception("AI forecast error")
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
+        logger.exception("AI forecast error – returning fallback")
+        return {"forecast": "AI service temporarily unavailable. Please try again later.", "trend_data": trend, "error": True}
 
 
 # ---------- SCORING & COMPLIANCE HELPERS ----------
@@ -957,6 +1216,11 @@ async def update_participation_status(id: str, body: dict, user: dict = Depends(
     if not p:
         raise HTTPException(status_code=404, detail="Participation not found")
         
+    if new_status == "approved":
+        config = await db.esg_config.find_one({})
+        if config and config.get("evidence_required", True) and not p.get("proof"):
+            raise HTTPException(status_code=400, detail="Approval blocked: Evidence proof is required.")
+            
     await db.employee_participations.update_one({"id": id}, {"$set": {"approval_status": new_status}})
     
     if new_status == "approved":
@@ -1093,6 +1357,8 @@ async def custom_report(
         tx_query.setdefault("date", {})["$lte"] = date_end
     if category:
         tx_query["category"] = category
+    if employee:
+        tx_query["logged_by"] = {"$regex": employee, "$options": "i"}
         
     if not module or module == "environmental":
         data["transactions"] = await db.carbon_transactions.find(tx_query, {"_id": 0}).to_list(1000)
@@ -1107,6 +1373,11 @@ async def custom_report(
         csr_query.setdefault("date", {})["$lte"] = date_end
     if category:
         csr_query["category"] = category
+    if employee:
+        csr_query["$or"] = [
+            {"organizer": {"$regex": employee, "$options": "i"}},
+            {"participants": {"$regex": employee, "$options": "i"}}
+        ]
         
     if not module or module == "social":
         data["csr"] = await db.csr_activities.find(csr_query, {"_id": 0}).to_list(1000)
@@ -1119,6 +1390,8 @@ async def custom_report(
         audit_query["scheduled_date"] = {"$gte": date_start}
     if date_end:
         audit_query.setdefault("scheduled_date", {})["$lte"] = date_end
+    if employee:
+        audit_query["auditor"] = {"$regex": employee, "$options": "i"}
         
     if not module or module == "governance":
         data["audits"] = await db.audits.find(audit_query, {"_id": 0}).to_list(1000)
@@ -1127,6 +1400,15 @@ async def custom_report(
     ch_query = {}
     if category:
         ch_query["category"] = category
+    if challenge:
+        ch_query["$or"] = [
+            {"id": challenge},
+            {"title": {"$regex": challenge, "$options": "i"}}
+        ]
+    if employee:
+        parts = await db.challenge_participations.find({"employee_name": {"$regex": employee, "$options": "i"}}, {"challenge_id": 1}).to_list(1000)
+        p_ids = [p["challenge_id"] for p in parts]
+        ch_query["id"] = {"$in": p_ids}
         
     if not module or module == "gamification":
         data["challenges"] = await db.challenges.find(ch_query, {"_id": 0}).to_list(1000)
@@ -1159,10 +1441,13 @@ async def root():
 
 app.include_router(api)
 
+# CORS: when origins="*", credentials must be False (spec requirement).
+_cors_origins = os.environ.get("CORS_ORIGINS", "*").split(",")
+_cors_creds = "*" not in _cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=_cors_creds,
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
